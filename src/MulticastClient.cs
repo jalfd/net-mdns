@@ -29,7 +29,7 @@ namespace Makaretu.Dns
         private static readonly IPAddress MulticastAddressIPv4 = IPAddress.Parse("224.0.0.251");
 
         private readonly List<UdpClient> _receivers = [];
-        private readonly ConcurrentDictionary<IPAddress, UdpClient> _senders = new();
+        private readonly ConcurrentDictionary<IPAddressAndNIC, UdpClient> _senders = new();
         private readonly Func<IPAddress, IPv6MulticastAddressScope> _ipv6MulticastScopeSelector;
 
         private bool _isDisposed = false;
@@ -64,16 +64,17 @@ namespace Makaretu.Dns
             }
 
             // Get the IP addresses that we should send to.
-            var addresses = nics
+            var addressesAndNics = nics
                 .SelectMany(GetNetworkInterfaceLocalAddresses)
-                .Where(a => (useIPv4 && a.AddressFamily == AddressFamily.InterNetwork)
-                    || (useIpv6 && a.AddressFamily == AddressFamily.InterNetworkV6));
-            foreach (var address in addresses)
+                .Where(a => (useIPv4 && a.Address.AddressFamily == AddressFamily.InterNetwork)
+                    || (useIpv6 && a.Address.AddressFamily == AddressFamily.InterNetworkV6));
+            foreach (var addressAndNic in addressesAndNics)
             {
-                if (_senders.ContainsKey(address))
+                if (_senders.ContainsKey(addressAndNic))
                 {
                     continue;
                 }
+                var address = addressAndNic.Address;
 
                 var localEndpoint = new IPEndPoint(address, MulticastPort);
                 var sender = new UdpClient(address.AddressFamily);
@@ -107,7 +108,7 @@ namespace Makaretu.Dns
 
                     _receivers.Add(sender);
                     Logger.Debug($"Will send via {localEndpoint}");
-                    if (!_senders.TryAdd(address, sender)) // Should not fail
+                    if (!_senders.TryAdd(addressAndNic, sender)) // Should not fail
                     {
                         sender.Dispose();
                     }
@@ -131,23 +132,75 @@ namespace Makaretu.Dns
             }
         }
 
-        public async Task SendAsync(byte[] message)
+        /// <summary>
+        /// Send a multicast message
+        /// </summary>
+        /// <param name="message">The message itself</param>
+        /// <param name="filterOnInterface">Toggle if address records should be filtered to contain only those valid on the network interface</param>
+        /// <returns></returns>
+        public async Task SendAsync(Message message, bool filterOnInterface)
         {
             foreach (var sender in _senders)
             {
                 try
                 {
-                    var multicastAddress = sender.Key.AddressFamily == AddressFamily.InterNetwork
+                    var multicastAddress = sender.Key.Address.AddressFamily == AddressFamily.InterNetwork
                         ? MulticastAddressIPv4
-                        : GetMulticastAddressIPv6(sender.Key);
+                        : GetMulticastAddressIPv6(sender.Key.Address);
 
-                    await sender.Value.SendAsync(message, message.Length, new(multicastAddress, MulticastPort)).ConfigureAwait(false);
+                    var actualMessage = filterOnInterface ? GetFilteredMessage(message, sender.Key.Interface) : message.ToByteArray();
+
+                    await sender.Value.SendAsync(actualMessage, actualMessage.Length, new(multicastAddress, MulticastPort)).ConfigureAwait(false);
                 }
                 catch (Exception e)
                 {
                     Logger.Error($"Sender {sender.Key} failure: {e.Message}");
                     // eat it.
                 }
+            }
+        }
+
+        /// <summary>
+        /// Send a unicast message
+        /// </summary>
+        /// <param name="nic">The network interface on which to send (used for filtering address records in the message)</param>
+        /// <param name="unicastClient">The client to use for sending the message</param>
+        /// <param name="remote">The recipient of the message</param>
+        /// <param name="message">The message itself</param>
+        /// <param name="filterOnInterface">Toggle if address records should be filtered to contain only those valid on the network interface</param>
+        /// <returns></returns>
+        public async Task SendAsUnicastAsync(NetworkInterface nic, UdpClient unicastClient, IPEndPoint remote, Message message, bool filterOnInterface)
+        {
+            var actualPacket = nic != null ? GetFilteredMessage(message, nic) : message.ToByteArray();
+            await unicastClient!.SendAsync(actualPacket, actualPacket.Length, remote).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Filters <see cref="AddressRecord"/> entries in a Message, removing any that are not valid on the specified interface
+        /// </summary>
+        /// <param name="msg">The message to filter</param>
+        /// <param name="networkInterface">The network interface on which addresses must be valid</param>
+        /// <returns>The serialized message</returns>
+        private static byte[] GetFilteredMessage(Message msg, NetworkInterface networkInterface)
+        {
+            // Make a backup of the properties we're going to change
+            var originalAllAdditional = msg.AdditionalRecords.ToList();
+            var originalAllAnswers = msg.Answers.ToList();
+
+            try
+            {
+                var nicAddresses = networkInterface.GetIPProperties().UnicastAddresses.Select(a => a.Address).ToList();
+                msg.AdditionalRecords.RemoveAll(record =>
+                    record is AddressRecord addressRecord && !nicAddresses.Contains(addressRecord.Address));
+                msg.Answers.RemoveAll(record =>
+                    record is AddressRecord addressRecord && !nicAddresses.Contains(addressRecord.Address));
+                return msg.ToByteArray();
+            }
+            finally
+            {
+                // Restore msg to its initial state, since multicast response depends on being able to reuse it
+                msg.AdditionalRecords = originalAllAdditional;
+                msg.Answers = originalAllAnswers;
             }
         }
 
@@ -174,13 +227,13 @@ namespace Makaretu.Dns
             });
         }
 
-        private IEnumerable<IPAddress> GetNetworkInterfaceLocalAddresses(NetworkInterface nic)
+        private IEnumerable<IPAddressAndNIC> GetNetworkInterfaceLocalAddresses(NetworkInterface nic)
         {
             return nic
                 .GetIPProperties()
                 .UnicastAddresses
-                .Select(x => x.Address)
-                .Where(x => x.AddressFamily != AddressFamily.InterNetworkV6 || x.IsIPv6LinkLocal);
+                .Select(x => new IPAddressAndNIC { Address = x.Address, Interface = nic })
+                .Where(x => x.Address.AddressFamily != AddressFamily.InterNetworkV6 || x.Address.IsIPv6LinkLocal);
         }
 
         private IPAddress GetMulticastAddressIPv6(IPAddress localAddress)
@@ -230,5 +283,38 @@ namespace Makaretu.Dns
         }
 
         #endregion IDisposable Support
+
+        private class IPAddressAndNIC
+        {
+            public IPAddress Address { get; set; }
+
+            public NetworkInterface Interface { get; set; }
+
+            // override object.Equals
+            public override bool Equals(object obj)
+            {
+                if (obj == null || GetType() != obj.GetType())
+                {
+                    return false;
+                }
+
+                var other = obj as IPAddressAndNIC;
+
+                if (!Equals(other.Address)) { return false; }
+
+                return Interface.Id.Equals(other.Interface.Id);
+            }
+
+            public override int GetHashCode()
+            {
+                // .net framework doesn't have HashCode.Combine :(
+                // Use the recommended alternative from https://stackoverflow.com/a/263416
+
+                var hash = 17;
+                hash *= 23 + Address.GetHashCode();
+                hash *= 23 + Interface.Id.GetHashCode();
+                return hash;
+            }
+        }
     }
 }

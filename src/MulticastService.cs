@@ -521,7 +521,7 @@ namespace Makaretu.Dns
         public void SendQuery(Message msg)
         {
             UpdateTTL(msg, false);
-            Send(msg, false);
+            Send(msg, false, false);
         }
 
         /// <summary>
@@ -580,7 +580,7 @@ namespace Makaretu.Dns
             answer.Truncate(maxPacketSize);
 
             UpdateTTL(answer, false);
-            Send(answer, checkDuplicate, unicastEndpoint);
+            Send(answer, checkDuplicate, true, unicastEndpoint);
         }
 
         /// <summary>
@@ -642,10 +642,10 @@ namespace Makaretu.Dns
 
             UpdateTTL(answer, true);
 
-            Send(answer, checkDuplicate, query.RemoteEndPoint);
+            Send(answer, checkDuplicate, true, query.RemoteEndPoint);
         }
 
-        internal void Send(Message msg, bool checkDuplicate, IPEndPoint remoteEndPoint = null)
+        internal void Send(Message msg, bool checkDuplicate, bool filterAddressRecords, IPEndPoint remoteEndPoint = null)
         {
             var packet = msg.ToByteArray();
             if (packet.Length > maxPacketSize)
@@ -660,17 +660,65 @@ namespace Makaretu.Dns
 
             if (remoteEndPoint == null)
             {
-                // Standard multicast reponse
-                _multicastClient?.SendAsync(packet).GetAwaiter().GetResult();
+                _multicastClient?.SendAsync(msg, filterAddressRecords).GetAwaiter().GetResult();
             }
             // Unicast response
             else
             {
+                var nic = GetNetworkInterfaceFromIp(remoteEndPoint.Address);
                 var unicastClient = (remoteEndPoint.Address.AddressFamily == AddressFamily.InterNetwork)
                     ? _unicastClientIPv4
                     : _unicastClientIPv6;
-                unicastClient?.SendAsync(packet, packet.Length, remoteEndPoint).GetAwaiter().GetResult();
+                _multicastClient?.SendAsUnicastAsync(nic, unicastClient, remoteEndPoint, msg, filterAddressRecords).GetAwaiter().GetResult();
             }
+        }
+
+        private NetworkInterface GetNetworkInterfaceFromIp(IPAddress remote)
+        {
+            foreach (var nic in knownNics) {
+                var nicAddresses = nic.GetIPProperties().UnicastAddresses;
+                foreach (var nicAddress in nicAddresses)
+                {
+                    if (nicAddress.Address.AddressFamily == remote.AddressFamily)
+                    {
+                        bool isMatch = remote.AddressFamily switch
+                        {
+                            AddressFamily.InterNetwork => isIpv4AddressInSubnet(nicAddress.Address, nicAddress.PrefixLength, remote),
+                            AddressFamily.InterNetworkV6 => nicAddress.Address.ScopeId == remote.ScopeId,
+                            _ => false
+                        };
+                        if (isMatch)
+                        {
+                            return nic;
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+
+        private static bool isIpv4AddressInSubnet(IPAddress interfaceAddr, int prefixLen, IPAddress addr)
+        {
+            var subnetBytes = interfaceAddr.GetAddressBytes();
+            var addrBytes = addr.GetAddressBytes();
+            if (subnetBytes.Length != addrBytes.Length)
+            {
+                return false;
+            }
+
+            // For prefix of length N, chec the first N/8 bytes by simple comparison
+            // Then for the last N%8 bits, we have to do bit fiddling to compare
+            var bytes = prefixLen / 8;
+            var bits = prefixLen % 8;
+            for (var i = 0; i < bytes; ++i)
+            {
+                if (subnetBytes[i] != addrBytes[i])
+                {
+                    return false;
+                }
+            }
+            byte mask = (byte)(byte.MaxValue << (8 - bits));
+            return (subnetBytes[bytes] & mask) == (addrBytes[bytes] & mask);
         }
 
         private static void UpdateTTL(Message msg, bool legacy)

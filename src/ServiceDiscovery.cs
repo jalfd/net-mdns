@@ -331,6 +331,9 @@ namespace Makaretu.Dns
             profile.Resources.ForEach((resource) =>
             {
                 var newResource = resource.Clone() as ResourceRecord;
+                if (newResource is AddressRecord ar && ar.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6) {
+                    ar.Address.ScopeId = (resource as AddressRecord).Address.ScopeId;
+                }
                 if (profile.SharedProfile == false)
                     newResource.Class = (DnsClass)((ushort)newResource.Class | MulticastService.CACHE_FLUSH_BIT);
                 message.Answers.Add(newResource);

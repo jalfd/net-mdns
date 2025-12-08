@@ -9,8 +9,8 @@
     <DebugType>full</DebugType>
     <DisableImplicitNuGetFallbackFolder>true</DisableImplicitNuGetFallbackFolder>
     
-    <AssemblyVersion>0.38</AssemblyVersion>
-    <Version>0.38</Version>
+    <AssemblyVersion>0.39</AssemblyVersion>
+    <Version>0.39</Version>
 	<LangVersion>latest</LangVersion>
     
     <!-- Nuget specs -->

@@ -297,19 +297,19 @@ namespace Makaretu.Dns
                 {
                     return false;
                 }
-
                 var other = obj as IPAddressAndNIC;
+                return Equals(other);
+            }
 
-                if (!Equals(other.Address)) { return false; }
-
-                return Interface.Id.Equals(other.Interface.Id);
+            public bool Equals(IPAddressAndNIC other)
+            {
+                return Address.Equals(other.Address) && Interface.Id.Equals(other.Interface.Id);
             }
 
             public override int GetHashCode()
             {
                 // .net framework doesn't have HashCode.Combine :(
                 // Use the recommended alternative from https://stackoverflow.com/a/263416
-
                 var hash = 17;
                 hash *= 23 + Address.GetHashCode();
                 hash *= 23 + Interface.Id.GetHashCode();
